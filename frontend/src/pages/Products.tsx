@@ -8,7 +8,7 @@ import { useChatResults } from '../chatResults'
 import { useFavorites } from '../favorites'
 import { COLOR_GROUPS, garmentColorIs } from '../colors'
 
-// Same order as backend/categories.py.
+// Same order as CATEGORIES in backend/tools.py.
 const CATEGORIES = ['Hoodies', 'Crewnecks', 'Quarter-Zips', 'T-Shirts', 'Long Sleeve', 'Fleece & Jackets']
 
 const SORTS = {

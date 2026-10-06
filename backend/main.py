@@ -4,18 +4,26 @@ Run from the backend/ folder (with the hw4 .venv activated):
     uvicorn main:app --reload --port 8000
 """
 
+import base64
+import fcntl
+import hashlib
+import hmac
 import json
 import logging
 import os
 import re
+import secrets
 import sqlite3
-from datetime import UTC, datetime
+import threading
+import time
+import uuid
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-# Load .env before the local modules below, which read settings when imported
-# (SESSION_SECRET in auth.py, AUDIT_TRAIL_PATH in audit.py, PORTKEY_API_KEY in agent.py).
+# Load .env first: settings are read when this file and agent.py load
+# (SESSION_SECRET and AUDIT_TRAIL_PATH below, PORTKEY_API_KEY in agent.py).
 # hw4/.env is used if present, otherwise the course-level .env one folder up.
 load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=False)
 load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env", override=False)
@@ -25,13 +33,20 @@ from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
 from pydantic import BaseModel, field_validator  # noqa: E402
 
-import audit  # noqa: E402
-import auth
-import chat_store
-from categories import category_for, primary_color
-from agent import MODEL_NAME, run_chat
-from safety import redact
-from models import (
+from pydantic_ai.messages import (  # noqa: E402
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    RetryPromptPart,
+    ToolCallPart,
+    ToolReturnPart,
+)
+
+from agent import MODEL_NAME, redact, run_chat  # noqa: E402
+from tools import category_for, primary_color  # noqa: E402
+from models import (  # noqa: E402
+    MAX_HISTORY,
+    ChatTurn,
     AgentDeps,
     ChatConversation,
     ChatRequest,
@@ -48,10 +63,409 @@ DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 DB_PATH = Path(os.environ.get("CAMPUS_DB", DATA_DIR / "campus_customs.db"))
 SIZE_ORDER = ["XS", "S", "M", "L", "XL", "XXL"]
 
+# ---------- Accounts: password hashing, sessions, login limits ----------
+# Password hashing and session cookies for Campus Customs.
+#
+# Passwords are never stored. Each one is run through PBKDF2-HMAC-SHA256 with a
+# random per-user salt, and only the result is saved in users.password_hash.
+
+ALGORITHM = "pbkdf2_sha256"
+# OWASP's recommended minimum for PBKDF2-HMAC-SHA256.
+ITERATIONS = 600_000
+# Seed accounts use a 3-part hash (pbkdf2_sha256$salt$digest) with no iteration
+# count stored; they were created with 120,000 iterations.
+LEGACY_ITERATIONS = int(os.environ.get("LEGACY_PBKDF2_ITERATIONS", "120000"))
+
+SESSION_COOKIE = "cc_session"
+SESSION_MAX_AGE = 60 * 60 * 24 * 7  # one week
+# Signs session cookies. Without SESSION_SECRET set, a random key is made at
+# startup, so everyone is logged out whenever the server restarts.
+_SESSION_KEY = os.environ.get("SESSION_SECRET", "").encode() or secrets.token_bytes(32)
+
+
+def _pbkdf2(password: str, salt: str, iterations: int) -> str:
+    return hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), iterations).hex()
+
+
+def hash_password(password: str) -> str:
+    """Return pbkdf2_sha256$<iterations>$<salt>$<hex digest>."""
+    salt = secrets.token_hex(16)
+    return f"{ALGORITHM}${ITERATIONS}${salt}${_pbkdf2(password, salt, ITERATIONS)}"
+
+
+def verify_password(password: str, stored: str) -> bool:
+    parts = stored.split("$")
+    if len(parts) == 4:
+        algorithm, iterations, salt, digest = parts
+        iterations = int(iterations)
+    elif len(parts) == 3:
+        algorithm, salt, digest = parts
+        iterations = LEGACY_ITERATIONS
+    else:
+        return False
+    if algorithm != ALGORITHM:
+        return False
+    # Constant-time comparison so response timing doesn't leak how close a guess was.
+    return hmac.compare_digest(_pbkdf2(password, salt, iterations), digest)
+
+
+# A real hash to check against when the email doesn't exist, so a login attempt
+# takes the same time whether or not the account is real.
+DUMMY_HASH = hash_password(secrets.token_hex(16))
+
+
+def make_session_token(user_id: int) -> str:
+    payload = base64.urlsafe_b64encode(
+        json.dumps({"uid": user_id, "exp": int(time.time()) + SESSION_MAX_AGE}).encode()
+    ).decode()
+    sig = hmac.new(_SESSION_KEY, payload.encode(), hashlib.sha256).hexdigest()
+    return f"{payload}.{sig}"
+
+
+def read_session_token(token: str | None) -> int | None:
+    """Return the user id from a valid, unexpired token, otherwise None."""
+    if not token or "." not in token:
+        return None
+    payload, sig = token.rsplit(".", 1)
+    expected = hmac.new(_SESSION_KEY, payload.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(sig, expected):
+        return None
+    try:
+        data = json.loads(base64.urlsafe_b64decode(payload))
+    except ValueError:
+        return None
+    if data.get("exp", 0) < time.time():
+        return None
+    return data.get("uid")
+
+
+class LoginLimiter:
+    """Blocks an email after too many failed logins in a short window."""
+
+    def __init__(self, max_failures: int = 5, window_seconds: int = 15 * 60):
+        self.max_failures = max_failures
+        self.window = window_seconds
+        self._failures: dict[str, list[float]] = {}
+
+    def _recent(self, key: str) -> list[float]:
+        cutoff = time.time() - self.window
+        recent = [t for t in self._failures.get(key, []) if t > cutoff]
+        self._failures[key] = recent
+        return recent
+
+    def is_blocked(self, key: str) -> bool:
+        return len(self._recent(key)) >= self.max_failures
+
+    def record_failure(self, key: str) -> None:
+        self._recent(key).append(time.time())
+
+    def reset(self, key: str) -> None:
+        self._failures.pop(key, None)
+
+
+# ---------- Chat history storage ----------
+# Saving and loading chat history in the chat_messages table.
+#
+# Each row also records mentioned_products: a JSON list of the product_ids that
+# message was about. On user rows this is what the customer asked about; on
+# assistant rows it's what the reply looked up or showed. The popularity tool
+# counts the user rows.
+
+# A reply about 1-3 items is about those items specifically; a longer list
+# (e.g. "here are 27 hoodies") is browsing and doesn't count as asking about each.
+SPECIFIC_MAX = 3
+# Old messages saved before conversations existed are split into separate chats
+# wherever there's a gap this long between messages.
+CONVERSATION_GAP = timedelta(hours=3)
+
+
+def new_conversation_id() -> str:
+    return uuid.uuid4().hex
+
+
+def _connect(db_path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _product_names(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+    rows = conn.execute("SELECT product_id, name FROM catalogue").fetchall()
+    # Longest names first so "Yale Sports Hoodie Golf" wins over a shorter overlap.
+    return sorted(((r["product_id"], r["name"].lower()) for r in rows), key=lambda t: -len(t[1]))
+
+
+def find_named_products(text: str, names: list[tuple[str, str]]) -> list[str]:
+    """product_ids whose full name (or id) appears in the text."""
+    lowered = text.lower()
+    found = []
+    for product_id, name in names:
+        if re.search(rf"\b{re.escape(name)}\b", lowered) or product_id in lowered:
+            found.append(product_id)
+    return found
+
+
+def ensure_schema(db_path: Path) -> None:
+    """Add the mentioned_products and conversation_id columns if missing, then fill them for old rows."""
+    with _connect(db_path) as conn:
+        columns = {r["name"] for r in conn.execute("PRAGMA table_info(chat_messages)")}
+        if "mentioned_products" not in columns:
+            conn.execute("ALTER TABLE chat_messages ADD COLUMN mentioned_products TEXT")
+        if "conversation_id" not in columns:
+            conn.execute("ALTER TABLE chat_messages ADD COLUMN conversation_id TEXT")
+        _backfill(conn)
+        _backfill_conversations(conn)
+
+
+def _backfill_conversations(conn: sqlite3.Connection) -> None:
+    """Group older messages into conversations by user, starting a new one after a long gap."""
+    rows = conn.execute(
+        "SELECT id, user_id, created_at FROM chat_messages WHERE conversation_id IS NULL ORDER BY user_id, id"
+    ).fetchall()
+    last_user, last_time, current = None, None, None
+    for r in rows:
+        t = datetime.fromisoformat(r["created_at"])
+        if r["user_id"] != last_user or last_time is None or t - last_time > CONVERSATION_GAP:
+            current = new_conversation_id()
+        conn.execute("UPDATE chat_messages SET conversation_id = ? WHERE id = ?", (current, r["id"]))
+        last_user, last_time = r["user_id"], t
+
+
+def _backfill(conn: sqlite3.Connection) -> None:
+    """Fill mentioned_products for rows saved before the column existed."""
+    rows = conn.execute(
+        "SELECT id, user_id, role, content, products_json FROM chat_messages"
+        " WHERE mentioned_products IS NULL ORDER BY id"
+    ).fetchall()
+    if not rows:
+        return
+    names = _product_names(conn)
+    for r in rows:
+        if r["role"] == "assistant":
+            cards = [p["product_id"] for p in json.loads(r["products_json"] or "[]")]
+            mentioned = list(dict.fromkeys(cards + find_named_products(r["content"], names)))
+        else:
+            mentioned = find_named_products(r["content"], names)
+            # Old rows have no tool-call record, so use the reply: if it was about
+            # 1-3 specific items, that's what the customer was asking about.
+            reply = conn.execute(
+                "SELECT content, products_json FROM chat_messages"
+                " WHERE user_id = ? AND id > ? AND role = 'assistant' ORDER BY id LIMIT 1",
+                (r["user_id"], r["id"]),
+            ).fetchone()
+            if reply:
+                cards = [p["product_id"] for p in json.loads(reply["products_json"] or "[]")]
+                specific = cards if cards else find_named_products(reply["content"], names)
+                if len(specific) <= SPECIFIC_MAX:
+                    mentioned = list(dict.fromkeys(mentioned + specific))
+        conn.execute(
+            "UPDATE chat_messages SET mentioned_products = ? WHERE id = ?",
+            (json.dumps(mentioned), r["id"]),
+        )
+
+
+def latest_conversation_id(db_path: Path, user_id: int) -> str | None:
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT conversation_id FROM chat_messages WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+            (user_id,),
+        ).fetchone()
+    return row["conversation_id"] if row else None
+
+
+def owns_conversation(db_path: Path, user_id: int, conversation_id: str) -> bool:
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT user_id FROM chat_messages WHERE conversation_id = ? LIMIT 1", (conversation_id,)
+        ).fetchone()
+    return row is not None and row["user_id"] == user_id
+
+
+def list_conversations(db_path: Path, user_id: int, limit: int = 30) -> list[dict]:
+    """The customer's past chats, newest first, with dates and a preview."""
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """SELECT conversation_id, MIN(created_at) AS started_at, MAX(created_at) AS last_message_at,
+                      COUNT(*) AS message_count, MAX(id) AS last_id,
+                      (SELECT content FROM chat_messages f WHERE f.conversation_id = m.conversation_id
+                         AND f.role = 'user' ORDER BY f.id LIMIT 1) AS first_message
+               FROM chat_messages m WHERE user_id = ? GROUP BY conversation_id
+               ORDER BY last_id DESC LIMIT ?""",
+            (user_id, limit),
+        ).fetchall()
+    return [
+        {
+            "conversation_id": r["conversation_id"],
+            "started_at": r["started_at"],
+            "last_message_at": r["last_message_at"],
+            "message_count": r["message_count"],
+            "preview": (r["first_message"] or "")[:80],
+        }
+        for r in rows
+    ]
+
+
+def load_conversation_rows(db_path: Path, user_id: int, conversation_id: str, limit: int) -> list[sqlite3.Row]:
+    """Most recent messages of one conversation, oldest first."""
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT role, content, products_json, created_at FROM chat_messages"
+            " WHERE user_id = ? AND conversation_id = ? ORDER BY id DESC LIMIT ?",
+            (user_id, conversation_id, limit),
+        ).fetchall()
+    return list(reversed(rows))
+
+
+def load_history_turns(db_path: Path, user_id: int, conversation_id: str) -> list[ChatTurn]:
+    """The agent's memory: recent messages from this conversation only."""
+    rows = load_conversation_rows(db_path, user_id, conversation_id, MAX_HISTORY)
+    return [ChatTurn(role=r["role"], content=r["content"]) for r in rows]
+
+
+def save_exchange(
+    db_path: Path,
+    user_id: int,
+    conversation_id: str,
+    message: str,
+    reply: str,
+    cards: list[ProductCard],
+    looked_up: list[str],
+    count_cards: bool = True,
+) -> None:
+    """Store the customer's message and the reply, with the products each was about.
+
+    looked_up: product_ids the agent fetched with get_product_details/check_stock
+    this turn (including the product on the page when the customer said "this").
+    count_cards: whether 1-3 cards shown count as the customer asking about them.
+    """
+    card_ids = [c.product_id for c in cards]
+    with _connect(db_path) as conn:
+        names = _product_names(conn)
+        asked = find_named_products(message, names) + looked_up
+        if count_cards and len(card_ids) <= SPECIFIC_MAX:
+            asked += card_ids
+        shown = card_ids + looked_up + find_named_products(reply, names)
+        conn.execute(
+            "INSERT INTO chat_messages (user_id, conversation_id, role, content, products_json, mentioned_products)"
+            " VALUES (?, ?, 'user', ?, NULL, ?)",
+            (user_id, conversation_id, message, json.dumps(list(dict.fromkeys(asked)))),
+        )
+        conn.execute(
+            "INSERT INTO chat_messages (user_id, conversation_id, role, content, products_json, mentioned_products)"
+            " VALUES (?, ?, 'assistant', ?, ?, ?)",
+            (
+                user_id,
+                conversation_id,
+                reply,
+                json.dumps([c.model_dump() for c in cards]),
+                json.dumps(list(dict.fromkeys(shown))),
+            ),
+        )
+
+
+# ---------- Audit trail ----------
+# Append-only audit trail of agent-loop activity: output/audit_trail.json.
+#
+# Every chat message the agent handles adds one entry: when it ran, who it was
+# for (customer id or guest, never an email), every tool call with short
+# args/results, and why the loop stopped. Entries are only ever appended; the
+# file is never cleared between runs or server restarts.
+
+AUDIT_PATH = Path(
+    os.environ.get("AUDIT_TRAIL_PATH", Path(__file__).resolve().parent.parent / "output" / "audit_trail.json")
+)
+SHORT_LIMIT = 200  # characters kept from each arg/result
+# The tool PydanticAI uses to return the structured ShopReply.
+OUTPUT_TOOL = "final_result"
+
+_lock = threading.Lock()
+
+
+def short(value: object, limit: int = SHORT_LIMIT) -> str:
+    """Compact, redacted, length-capped text for the log."""
+    text = value if isinstance(value, str) else json.dumps(value, default=str, ensure_ascii=False)
+    text = redact(" ".join(text.split()))
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _iso(dt: datetime | None) -> str | None:
+    return dt.astimezone(UTC).isoformat(timespec="milliseconds") if dt else None
+
+
+def loop_events(messages: list[ModelMessage]) -> list[dict]:
+    """Turn one run's messages into a timeline of tool calls, results, and retries."""
+    events: list[dict] = []
+    for msg in messages:
+        if isinstance(msg, ModelResponse):
+            for part in msg.parts:
+                if isinstance(part, ToolCallPart):
+                    events.append(
+                        {
+                            "time": _iso(msg.timestamp),
+                            "type": "final_output" if part.tool_name == OUTPUT_TOOL else "tool_call",
+                            "tool": part.tool_name,
+                            "args": short(part.args_as_dict()),
+                        }
+                    )
+        elif isinstance(msg, ModelRequest):
+            for part in msg.parts:
+                if isinstance(part, ToolReturnPart) and part.tool_name != OUTPUT_TOOL:
+                    events.append(
+                        {
+                            "time": _iso(part.timestamp),
+                            "type": "tool_result",
+                            "tool": part.tool_name,
+                            "result": short(part.model_response_str()),
+                        }
+                    )
+                elif isinstance(part, RetryPromptPart):
+                    events.append(
+                        {
+                            "time": _iso(part.timestamp),
+                            "type": "retry",
+                            "tool": part.tool_name,
+                            "result": short(part.model_response()),
+                        }
+                    )
+    return events
+
+
+def model_finish_reason(messages: list[ModelMessage]) -> str | None:
+    for msg in reversed(messages):
+        if isinstance(msg, ModelResponse):
+            return msg.finish_reason
+    return None
+
+
+def append_entry(entry: dict) -> None:
+    """Append one entry, keeping the file a valid JSON list. Never truncates history."""
+    AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with _lock, open(AUDIT_PATH.with_name(".audit_trail.lock"), "w") as lock_file:
+        # File lock as well, in case two server processes write at once.
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        entries: list = []
+        if AUDIT_PATH.exists() and AUDIT_PATH.stat().st_size > 0:
+            try:
+                entries = json.loads(AUDIT_PATH.read_text(encoding="utf-8"))
+                if not isinstance(entries, list):
+                    raise ValueError("audit trail is not a list")
+            except ValueError:
+                # Never overwrite a damaged log: keep it under a new name and start fresh.
+                stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
+                AUDIT_PATH.rename(AUDIT_PATH.with_name(f"audit_trail.corrupt-{stamp}.json"))
+                entries = []
+        entries.append(entry)
+        tmp = AUDIT_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(entries, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        os.replace(tmp, AUDIT_PATH)  # atomic: readers never see a half-written file
+
+
+# ---------- App, products, and images ----------
+
 app = FastAPI(title="Campus Customs API")
 
 # Adds chat_messages.mentioned_products on first run and fills it for old rows.
-chat_store.ensure_schema(DB_PATH)
+ensure_schema(DB_PATH)
 
 app.add_middleware(
     CORSMiddleware,
@@ -152,11 +566,11 @@ def get_product(product_id: str) -> dict:
     return product
 
 
-# ---------- Accounts ----------
+# ---------- Account routes ----------
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 MIN_PASSWORD_LENGTH = 8
-login_limiter = auth.LoginLimiter()
+login_limiter = LoginLimiter()
 
 
 def _clean_email(value: str) -> str:
@@ -208,9 +622,9 @@ def _user_from_row(row: sqlite3.Row) -> dict:
 
 def _start_session(response: Response, user_id: int) -> None:
     response.set_cookie(
-        auth.SESSION_COOKIE,
-        auth.make_session_token(user_id),
-        max_age=auth.SESSION_MAX_AGE,
+        SESSION_COOKIE,
+        make_session_token(user_id),
+        max_age=SESSION_MAX_AGE,
         httponly=True,  # page JavaScript can't read the cookie
         samesite="lax",
         # Set secure=True when the site is served over HTTPS.
@@ -218,7 +632,7 @@ def _start_session(response: Response, user_id: int) -> None:
 
 
 def current_user(token: str | None) -> dict | None:
-    user_id = auth.read_session_token(token)
+    user_id = read_session_token(token)
     if user_id is None:
         return None
     with get_db() as conn:
@@ -241,7 +655,7 @@ def signup(req: SignupRequest, response: Response) -> dict:
                 (
                     f"{req.first_name} {req.last_name}",
                     req.email,
-                    auth.hash_password(req.password),
+                    hash_password(req.password),
                     req.first_name,
                     req.last_name,
                 ),
@@ -262,8 +676,8 @@ def login(req: LoginRequest, response: Response) -> dict:
     with get_db() as conn:
         row = conn.execute("SELECT * FROM users WHERE email = ?", (req.email,)).fetchone()
 
-    stored = row["password_hash"] if row else auth.DUMMY_HASH
-    if not auth.verify_password(req.password, stored) or row is None:
+    stored = row["password_hash"] if row else DUMMY_HASH
+    if not verify_password(req.password, stored) or row is None:
         login_limiter.record_failure(req.email)
         # Same message either way, so it doesn't reveal which emails have accounts.
         raise HTTPException(401, "Incorrect email or password")
@@ -275,7 +689,7 @@ def login(req: LoginRequest, response: Response) -> dict:
 
 @app.post("/api/auth/logout", status_code=204)
 def logout(response: Response) -> None:
-    response.delete_cookie(auth.SESSION_COOKIE)
+    response.delete_cookie(SESSION_COOKIE)
 
 
 @app.get("/api/auth/me", response_model=User | None)
@@ -283,7 +697,7 @@ def me(cc_session: str | None = Cookie(default=None)) -> dict | None:
     return current_user(cc_session)
 
 
-# ---------- Chat ----------
+# ---------- Chat routes ----------
 
 logger = logging.getLogger("campus_customs.chat")
 BLOCKED_REPLY = (
@@ -322,7 +736,7 @@ def build_page_context(page: PageInfo) -> PageContext:
 def chat_conversations(cc_session: str | None = Cookie(default=None)) -> list[dict]:
     """The logged-in customer's past chats (newest first); empty for guests."""
     user = current_user(cc_session)
-    return chat_store.list_conversations(DB_PATH, user["id"]) if user else []
+    return list_conversations(DB_PATH, user["id"]) if user else []
 
 
 @app.get("/api/chat/history", response_model=ChatConversation)
@@ -334,14 +748,14 @@ def chat_history(
     if user is None:
         return ChatConversation(conversation_id=None, messages=[])
     if conversation_id is None:
-        conversation_id = chat_store.latest_conversation_id(DB_PATH, user["id"])
-    elif not chat_store.owns_conversation(DB_PATH, user["id"], conversation_id):
+        conversation_id = latest_conversation_id(DB_PATH, user["id"])
+    elif not owns_conversation(DB_PATH, user["id"], conversation_id):
         raise HTTPException(404, "Conversation not found")
     if conversation_id is None:
         return ChatConversation(conversation_id=None, messages=[])
 
     messages = []
-    for r in chat_store.load_conversation_rows(DB_PATH, user["id"], conversation_id, HISTORY_PAGE_SIZE):
+    for r in load_conversation_rows(DB_PATH, user["id"], conversation_id, HISTORY_PAGE_SIZE):
         # Rebuild cards from the catalogue by id, so restored chats show current
         # prices/stock and cards saved before newer fields existed still load.
         try:
@@ -371,9 +785,9 @@ async def chat(req: ChatRequest, cc_session: str | None = Cookie(default=None)) 
     conversation_id = None
     if customer:
         conversation_id = req.conversation_id
-        if conversation_id is None or not chat_store.owns_conversation(DB_PATH, customer.id, conversation_id):
-            conversation_id = chat_store.new_conversation_id()
-        history = chat_store.load_history_turns(DB_PATH, customer.id, conversation_id)
+        if conversation_id is None or not owns_conversation(DB_PATH, customer.id, conversation_id):
+            conversation_id = new_conversation_id()
+        history = load_history_turns(DB_PATH, customer.id, conversation_id)
     else:
         history = req.history
 
@@ -400,8 +814,8 @@ async def chat(req: ChatRequest, cc_session: str | None = Cookie(default=None)) 
         reply = None
         logger.error("Agent run failed: %s (%s)", run.stop_reason, run.detail)
 
-    events = audit.loop_events(run.messages)
-    audit.append_entry(
+    events = loop_events(run.messages)
+    append_entry(
         {
             "time": started.isoformat(timespec="milliseconds"),
             "duration_ms": int((datetime.now(UTC) - started).total_seconds() * 1000),
@@ -409,15 +823,15 @@ async def chat(req: ChatRequest, cc_session: str | None = Cookie(default=None)) 
             "customer": f"user #{customer.id}" if customer else "guest",
             "conversation_id": conversation_id,
             "page": deps.page.product_id or deps.page.path,
-            "message": audit.short(req.message),
+            "message": short(req.message),
             "events": events,
             "tool_calls": sum(1 for e in events if e["type"] == "tool_call"),
             "model_requests": run.requests,
             "tokens": {"input": run.input_tokens, "output": run.output_tokens},
             "stop_reason": run.stop_reason,
-            "model_finish_reason": audit.model_finish_reason(run.messages),
+            "model_finish_reason": model_finish_reason(run.messages),
             "stop_detail": run.detail,
-            "reply": audit.short(reply) if reply else None,
+            "reply": short(reply) if reply else None,
             "cards_shown": len(cards),
             "reply_redacted": redacted,
         }
@@ -427,7 +841,7 @@ async def chat(req: ChatRequest, cc_session: str | None = Cookie(default=None)) 
         # Never send stack traces or keys to the browser.
         raise HTTPException(502, UNAVAILABLE)
     if customer:
-        chat_store.save_exchange(
+        save_exchange(
             DB_PATH,
             customer.id,
             conversation_id,

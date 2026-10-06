@@ -75,10 +75,10 @@ Open **http://localhost:5173**. Vite proxies `/api` and `/images` to the backend
 | `SESSION_SECRET` | random per start | Signs login cookies. Set it so logins survive restarts. | Problem 4 |
 | `CAMPUS_DB` | `data/campus_customs.db` | Point the backend at another database (used for testing on a copy). | Problem 4 |
 | `AUDIT_TRAIL_PATH` | `output/audit_trail.json` | Where audit entries are appended. | Problem 12 |
-| `LEGACY_PBKDF2_ITERATIONS` | set in `auth.py` | Iteration count for the 3 seed accounts' older hash format. | Problem 4 |
+| `LEGACY_PBKDF2_ITERATIONS` | set in `main.py` | Iteration count for the 3 seed accounts' older hash format. | Problem 4 |
 | `PORTKEY_BASE_URL` | `https://api.portkey.ai/v1` | Portkey gateway URL. | Problem 5 |
 
-On startup the backend runs `chat_store.ensure_schema`, which adds and backfills the `mentioned_products` and `conversation_id` columns if they're missing. It's safe to run any number of times.
+On startup the backend runs `ensure_schema` (in `main.py`), which adds and backfills the `mentioned_products` and `conversation_id` columns if they're missing. It's safe to run any number of times.
 
 ---
 
@@ -88,16 +88,11 @@ On startup the backend runs `chat_store.ensure_schema`, which adds and backfills
 
 | Path | Role | Added in |
 |---|---|---|
-| `backend/main.py` | FastAPI app: products, images, auth, chat route, chat history endpoints. Run with Uvicorn. | Problem 3 |
-| `backend/agent.py` | Agent entry and wiring: Portkey model, PydanticAI `Agent`, dynamic instructions, loop limits, `run_chat`. | Problem 5 |
+| `backend/main.py` | FastAPI app (run with Uvicorn), in sections: accounts (password hashing, sessions, login limits), chat history storage (conversations, `mentioned_products`, schema migration), audit trail writer, then the product, image, account, and chat routes. | Problem 3 (accounts Problem 4, chat storage Problems 8–10, audit trail Problem 12) |
+| `backend/agent.py` | Agent entry and wiring: safety limits and reply redaction, Portkey model, PydanticAI `Agent`, dynamic instructions, `run_chat`. | Problem 5 (limits and redaction Problem 12) |
 | `backend/prompts/prompt.md` | System prompt: voice, tool rules, product-card rules, memory/page rules, safety rules. Re-read on every run. | Problem 5 |
-| `backend/tools.py` | Tools the agent can call (read-only database lookups and context). | Problem 5 |
+| `backend/tools.py` | Tools the agent can call (read-only database lookups and context), plus the category mapping (22 `garment_type` values → 6 categories) and garment `primary_color`. | Problem 5 (categories Problem 9, garment color Problem 10) |
 | `backend/models.py` | Pydantic / PydanticAI structured types (API bodies, agent output, tool results, deps). | Problem 5 |
-| `backend/auth.py` | Password hashing, session cookies, login rate limiter. | Problem 4 |
-| `backend/chat_store.py` | Saving/loading chat history, conversations, `mentioned_products`, schema migration. | Problem 9 |
-| `backend/categories.py` | Maps 22 `garment_type` values to 6 categories; garment `primary_color`. | Problem 9 |
-| `backend/safety.py` | Loop-limit constants and the reply redaction filter. | Problem 12 |
-| `backend/audit.py` | Append-only audit trail writer. | Problem 12 |
 | `frontend/src/` | React app: `pages/`, `components/` (NavBar, ProductCard, ChatWidget, PriceRangeSlider, …), `api.ts`, `auth.tsx`, `favorites.tsx`, `chatResults.tsx`, `colors.ts`, `index.css`. | Problem 3 |
 | `data/` | `campus_customs.db` and `products/*.jpg`. | Provided with the homework (unzipped before Problem 2) |
 | `output/` | Harness, write-ups, app check, audit trail. | Problem 2 |
@@ -118,7 +113,7 @@ SQLite with four tables. `inventory.product_id` → `catalogue`; `chat_messages.
 |---|---|---|
 | `product_id` | TEXT, PK | Stable key linking a product to its stock rows, its image, its page URL, and any product the agent recommends. |
 | `name` | TEXT | Title on cards and in chat replies. |
-| `garment_type` | TEXT | Kind of clothing. It has 22 inconsistent values, so `categories.py` maps it to 6 general categories for filtering and search. |
+| `garment_type` | TEXT | Kind of clothing. It has 22 inconsistent values, so `tools.py` maps it to 6 general categories for filtering and search. |
 | `description` | TEXT | Lets the agent answer detail questions (hood, logo, fit) without guessing. Starts with the garment color. |
 | `colors` | TEXT (JSON array) | All colors on the product: the garment color first, then logo and lettering colors. The first one becomes `primary_color`. |
 | `search_tags` | TEXT (JSON array) | Keywords that let search match natural phrases ("Harvard rivalry", "college merch"). |
@@ -353,19 +348,19 @@ Other prompt rules: always call a tool before stating a price, stock, color, or 
 
 | Protection | Where | Added in |
 |---|---|---|
-| Reply redaction: password hashes, card numbers, and API keys → `[removed]`; any email other than the customer's own → masked (`a***@yale.edu`). Applied before the reply is shown, saved, or audited. | `safety.redact`, chat route | Problem 12 |
+| Reply redaction: password hashes, card numbers, and API keys → `[removed]`; any email other than the customer's own → masked (`a***@yale.edu`). Applied before the reply is shown, saved, or audited. | `agent.redact`, chat route | Problem 12 |
 | Loop limits and timeout (Section 12) | `agent.run_chat` | Problem 12 |
 | Read-only, parameterized database access for all agent tools; no tool can read `users` or passwords | `tools.py` | Problem 6 |
 | Product cards rebuilt from the database; unknown ids dropped | `load_product_cards` | Problem 7 |
 | Page context validated against the catalogue; unsafe paths replaced | `build_page_context` | Problem 8 |
-| Customer identity only from the signed cookie; conversations checked for ownership (404 otherwise) | `main.py`, `chat_store.owns_conversation` | Problem 8 (ownership checks Problem 10) |
+| Customer identity only from the signed cookie; conversations checked for ownership (404 otherwise) | `main.py` (`owns_conversation`) | Problem 8 (ownership checks Problem 10) |
 | Input validation: message 1–2,000 chars, ≤ 20 history turns, `conversation_id` pattern | `ChatRequest` | Problem 5 (page Problem 8, id pattern Problem 10) |
 | Provider content filter → polite in-voice decline instead of an error | chat route | Problem 5 |
 | Errors return a generic 502; stack traces and keys stay in server logs | chat route | Problem 5 |
 | Only `data/products/` is served publicly (the database file can't be downloaded) | static mount | Problem 3 |
-| Passwords hashed (PBKDF2, 600k iterations, salt), login rate limit, signed `httpOnly` cookie | `auth.py` | Problem 4 |
+| Passwords hashed (PBKDF2, 600k iterations, salt), login rate limit, signed `httpOnly` cookie | `main.py` (accounts section) | Problem 4 |
 | Chat formatting renders React elements, never raw HTML | `ChatMarkdown.tsx` | Problem 10 |
-| Audit trail stores `user #id` or `guest` (no emails), with args/results redacted and capped | `audit.py` | Problem 12 |
+| Audit trail stores `user #id` or `guest` (no emails), with args/results redacted and capped | `main.py` (audit trail section) | Problem 12 |
 | `.env` (API key) is git-ignored and never logged | `.gitignore`, `agent.py` | Problem 5 |
 
 ---
@@ -377,24 +372,24 @@ Other prompt rules: always call a tool before stating a price, stock, color, or 
 | Spec | Value | Where | Added in |
 |---|---|---|---|
 | Model | `gpt-5.6-luna` via Portkey | `agent.py` | Problem 5 |
-| Model requests per customer message | **6** | `safety.MAX_MODEL_REQUESTS` → `UsageLimits` | Problem 12 |
-| Tool calls per customer message | **10** | `safety.MAX_TOOL_CALLS` | Problem 12 |
-| Tokens (input + output) per customer message | **120,000** | `safety.MAX_TOTAL_TOKENS` | Problem 12 |
-| Time per reply | **60 s** | `safety.RUN_TIMEOUT_SECONDS` | Problem 12 |
+| Model requests per customer message | **6** | `agent.MAX_MODEL_REQUESTS` → `UsageLimits` | Problem 12 |
+| Tool calls per customer message | **10** | `agent.MAX_TOOL_CALLS` | Problem 12 |
+| Tokens (input + output) per customer message | **120,000** | `agent.MAX_TOTAL_TOKENS` | Problem 12 |
+| Time per reply | **60 s** | `agent.RUN_TIMEOUT_SECONDS` | Problem 12 |
 | Output validation retries | 2 | `Agent(retries=2)` | Problem 5 |
 | Customer message length | 1–2,000 characters | `ChatRequest` | Problem 5 |
 | Agent memory | last 20 messages of the current conversation | `MAX_HISTORY` | Problem 5 (per conversation Problem 10) |
 | `search_products` results | 12 default, **40 max** | `tools.py` | Problem 6 (raised to 40 in Problem 7) |
 | `get_popular_products` results | 5 default, **10 max** | `tools.py` | Problem 9 |
 | Product cards per reply | **40 max** | `ShopReply.product_ids` | Problem 7 |
-| "Specific" answer for `mentioned_products` | 1–3 cards | `chat_store.SPECIFIC_MAX` | Problem 9 |
+| "Specific" answer for `mentioned_products` | 1–3 cards | `main.SPECIFIC_MAX` | Problem 9 |
 | Chat history endpoint | 50 messages | `HISTORY_PAGE_SIZE` | Problem 8 |
-| Past chats list | 30 conversations | `chat_store.list_conversations` | Problem 10 |
-| Old-message chat grouping gap | 3 hours | `chat_store.CONVERSATION_GAP` | Problem 10 |
-| Audit args/result length | 200 characters each | `audit.SHORT_LIMIT` | Problem 12 |
-| Password | ≥ 8 characters; PBKDF2-SHA256, 600,000 iterations | `auth.py`, `main.py` | Problem 4 |
-| Login attempts | 5 failures per email per 15 minutes | `auth.LoginLimiter` | Problem 4 |
-| Session length | 7 days | `auth.SESSION_MAX_AGE` | Problem 4 |
+| Past chats list | 30 conversations | `main.list_conversations` | Problem 10 |
+| Old-message chat grouping gap | 3 hours | `main.CONVERSATION_GAP` | Problem 10 |
+| Audit args/result length | 200 characters each | `main.SHORT_LIMIT` | Problem 12 |
+| Password | ≥ 8 characters; PBKDF2-SHA256, 600,000 iterations | `main.py` | Problem 4 |
+| Login attempts | 5 failures per email per 15 minutes | `main.LoginLimiter` | Problem 4 |
+| Session length | 7 days | `main.SESSION_MAX_AGE` | Problem 4 |
 | Ports | backend 8000, frontend 5173 | — | Problem 3 |
 
 ---

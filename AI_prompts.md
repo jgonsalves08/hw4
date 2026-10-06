@@ -237,6 +237,6 @@ Prompts used with the AI assistant for each problem. Each section lists the init
 
 **Follow-up prompt (if needed):**
 
-> Not needed.
+> Let's merge them so it looks like the expected layout picture. And then update any other necessary files that referred to them
 
-**What was lacking after the first prompt:** Nothing — no follow-up was needed.
+**What was lacking after the first prompt:** The pushed backend had five extra helper files (`auth.py`, `chat_store.py`, `categories.py`, `safety.py`, `audit.py`) that weren't in the expected layout, so they were merged into `main.py`, `agent.py`, and `tools.py`, and the docs that referred to them were updated.

@@ -22,9 +22,8 @@ hw4/
 │   ├── agent.py             # agent entry and wiring (model, prompt, limits)
 │   ├── models.py            # Pydantic / PydanticAI structured types
 │   ├── tools.py             # tools the agent can call
-│   ├── prompts/
-│   │   └── prompt.md        # system prompt (voice, tool rules, safety rules)
-│   └── auth.py, chat_store.py, categories.py, safety.py, audit.py   # supporting modules
+│   └── prompts/
+│       └── prompt.md        # system prompt (voice, tool rules, safety rules)
 └── output/
     ├── harness.md           # how the whole system works
     ├── design.md
@@ -34,7 +33,7 @@ hw4/
     └── audit_trail.json     # append-only log of agent-loop activity
 ```
 
-The agent is `backend/prompts/prompt.md`, `backend/agent.py`, `backend/tools.py`, and `backend/models.py`. The other backend files hold account login, chat-history storage, product categories, safety filters, and the audit-trail writer.
+The agent is `backend/prompts/prompt.md`, `backend/agent.py`, `backend/tools.py`, and `backend/models.py`. `backend/main.py` is the FastAPI app, including accounts, chat-history storage, and the audit-trail writer.
 
 ## 1. Place the data pack (local only, not in git)
 

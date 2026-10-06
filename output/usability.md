@@ -14,7 +14,7 @@ Four improvements to Campus Customs: two on the website (front end) and two in t
 - Clicking a type filters the product cards to just that type. Clicking it again (or **All**) shows everything.
 - The filter works on chat search results too, and the counts update to match what's on screen.
 - The chosen filter is saved in the page URL (e.g. `/products?category=Hoodies`), so it's still applied after opening an item and pressing Back, and the link can be shared.
-- Behind the scenes: the database's `garment_type` column has 22 inconsistent labels ("pullover hoodie", "hooded sweatshirt", "short-sleeve T-shirt", "t-shirt", …). `backend/categories.py` maps them into 6 general categories, and every product returned by the API now includes a `category` field.
+- Behind the scenes: the database's `garment_type` column has 22 inconsistent labels ("pullover hoodie", "hooded sweatshirt", "short-sleeve T-shirt", "t-shirt", …). the category mapping in `backend/tools.py` groups them into 6 general categories, and every product returned by the API now includes a `category` field.
 
 **Why it helps**
 
@@ -62,8 +62,8 @@ Four improvements to Campus Customs: two on the website (front end) and two in t
   - **Customer rows:** the products the customer asked about. This means products named in their message, products the agent looked up for them with `get_product_details` or `check_stock` (which covers "do you have *this* in pink?" on a product page), and a short answer's 1–3 product cards.
   - **Assistant rows:** every product the reply looked up, named, or showed as a card.
   - Broad browsing ("what hoodies do you have?" → 27 cards) isn't counted as asking about all 27, so the data reflects real interest.
-- The column is added automatically when the server starts (`chat_store.ensure_schema`), and is safe to run more than once. Messages saved before the column existed were filled in from their text and the reply that followed (e.g. "you have this in pink?" → the Baseball Left Chest Crewneck).
-- Chat saving and loading moved into `backend/chat_store.py`. The agent run now reports which tools it used and which products it looked up, so they can be recorded.
+- The column is added automatically when the server starts (`ensure_schema` in `backend/main.py`), and is safe to run more than once. Messages saved before the column existed were filled in from their text and the reply that followed (e.g. "you have this in pink?" → the Baseball Left Chest Crewneck).
+- Chat saving and loading live in the chat-history section of `backend/main.py`. The agent run now reports which tools it used and which products it looked up, so they can be recorded.
 
 **Why it helps**
 
