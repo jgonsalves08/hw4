@@ -1,0 +1,27 @@
+# Local-only data pack (database + product images) — never committed
+data/
+*.db
+*.sqlite
+*.zip
+
+# Secrets: only the placeholder .env.example is committed
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Node / Vite
+node_modules/
+frontend/dist/
+
+# Audit trail lock/temp files (the audit trail itself is committed)
+output/.audit_trail.lock
+output/*.json.tmp
+
+# Local tooling and OS files
+.claude/
+.DS_Store
